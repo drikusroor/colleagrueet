@@ -1,11 +1,16 @@
 # Office Person Greeter
 
-A Python application that uses YOLO (You Only Look Once) to detect and identify people entering your office, greeting them by name using natural text-to-speech.
+A Python application that uses YOLO for person detection and DeepFace for facial analysis to identify and greet people entering your office by name using natural text-to-speech.
 
 ## Features
 
 - Real-time person detection using YOLOv8
-- Advanced feature detection (skin tone, hair color/length, facial hair, build)
+- **Professional facial analysis using DeepFace**:
+  - Gender detection (Man/Woman)
+  - Age estimation
+  - Race/ethnicity detection
+  - Facial hair detection (heuristic)
+  - Glasses detection (heuristic)
 - Person identification matching against configured profiles
 - Natural text-to-speech greetings using Google TTS
 - Unknown person detection for security alerts
@@ -29,6 +34,8 @@ This project uses [uv](https://github.com/astral-sh/uv) for package management:
 uv sync
 ```
 
+**Note**: On first run, DeepFace will download AI models (~100MB) for facial analysis. This is a one-time setup.
+
 ## Configuration
 
 Edit `people_config.py` to add your office mates:
@@ -36,15 +43,15 @@ Edit `people_config.py` to add your office mates:
 ```python
 KNOWN_PEOPLE = [
     {
-        "name": "John",
-        "greeting": "Hello John! Welcome back!",
+        "name": "Drikus",
+        "greeting": "Hello Drikus! Welcome back!",
         "features": {
-            "skin_tone": "light",      # light, medium, dark
-            "hair_color": "dark",       # dark, light, brown, red
-            "hair_length": "short",     # short, medium, long
-            "facial_hair": "beard",     # none, mustache, beard
-            "glasses": True,
-            "build": "average"          # slim, average, heavy
+            "gender": "Man",              # Man, Woman
+            "age_range": (25, 35),        # age range tuple
+            "race": "white",              # white, black, asian, indian, 
+                                          # latino mediterranean, middle eastern
+            "facial_hair": True,          # True if has beard/mustache
+            "glasses": True,              # True if wears glasses
         }
     }
 ]
@@ -59,25 +66,32 @@ uv run main.py
 ```
 
 The application will:
-1. Open your webcam
-2. Display a window showing the video feed
-3. Detect people entering the office
-4. Analyze their features (hair, facial hair, build, skin tone)
-5. Match them against known people
-6. Greet them by name with a personalized message
-7. Alert if an unknown person is detected
-8. Continue until you press 'q' to quit
+1. Warm up DeepFace models (first run downloads models)
+2. Open your webcam
+3. Display a window showing the video feed
+4. Detect people entering the office
+5. Analyze their features using AI (gender, age, race, facial hair, glasses)
+6. Match them against known people with scoring system
+7. Greet them by name with a personalized message
+8. Alert if an unknown person is detected
+9. Continue until you press 'q' to quit
 
 ## How It Works
 
 - **Detection**: Uses YOLOv8 nano model for fast, efficient person detection
-- **Feature Analysis**: Analyzes detected person's appearance:
-  - Skin tone (light/medium/dark)
-  - Hair color (dark/light/brown/red)
-  - Hair length (short/medium/long)
-  - Facial hair (none/mustache/beard)
-  - Build (slim/average/heavy)
-- **Matching**: Scores detected features against known people profiles
+- **Facial Analysis**: Uses DeepFace (state-of-the-art facial recognition framework) to detect:
+  - Gender (Man/Woman)
+  - Age (estimated years)
+  - Race/Ethnicity (white, black, asian, indian, latino mediterranean, middle eastern)
+  - Facial hair (beard detection via image analysis)
+  - Glasses (bright reflection detection)
+- **Matching**: Scores detected features against known people profiles:
+  - Gender match: 2 points
+  - Race match: 2 points
+  - Age match (±8 years tolerance): 1 point
+  - Facial hair match: 0.5 points
+  - Glasses match: 0.5 points
+  - Threshold: 2.5 points minimum to identify
 - **Greeting**: Uses Google TTS for natural-sounding greetings
 - **Security**: Identifies unknown people with a different message
 - **Cooldown**: 15-second interval and movement detection prevents spam
@@ -90,5 +104,13 @@ The application will:
 
 When an unknown person is detected, the system:
 - Plays a different greeting asking them to check in at reception
-- Logs the detection with feature details
+- Logs the detection with detailed feature analysis
 - Could be extended to send notifications/alerts
+
+## Technical Details
+
+- **YOLO**: Fast object detection for real-time person tracking
+- **DeepFace**: State-of-the-art facial attribute analysis
+- **Google TTS**: Natural-sounding voice synthesis
+- **Pygame**: Audio playback
+- **Threading**: Non-blocking speech for continuous detection

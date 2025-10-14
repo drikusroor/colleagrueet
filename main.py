@@ -2,12 +2,13 @@ import cv2
 from gtts import gTTS
 import pygame
 from ultralytics import YOLO
+from deepface import DeepFace
 import time
 import numpy as np
 import threading
 import os
 import tempfile
-from people_config import KNOWN_PEOPLE, MATCH_THRESHOLD, UNKNOWN_GREETING
+from people_config import KNOWN_PEOPLE, MATCH_THRESHOLD, UNKNOWN_GREETING, AGE_TOLERANCE
 
 
 class PersonDetector:
@@ -20,114 +21,219 @@ class PersonDetector:
         self.is_speaking = False
         self.lock = threading.Lock()
         self.greeted_people = set()  # Track who we've greeted recently
+        print("Warming up DeepFace models...")
+        # Warm up DeepFace to download models on first run
+        try:
+            dummy = np.zeros((224, 224, 3), dtype=np.uint8)
+            DeepFace.analyze(dummy, actions=['age', 'gender', 'race', 'emotion'], 
+                           enforce_detection=False, silent=True)
+        except:
+            pass
+        print("DeepFace ready!")
         
-    def analyze_features(self, person_crop, face_region):
-        """Analyze person's features for identification"""
-        h, w = person_crop.shape[:2]
-        
-        # Analyze face/head region for skin tone and hair
-        face_crop = person_crop[0:int(h*0.3), :]
-        
-        # Get average colors from different regions
-        face_avg = np.mean(face_crop, axis=(0, 1))
-        
-        # Hair region (top 15% of person)
-        hair_region = person_crop[0:int(h*0.15), :]
-        hair_avg = np.mean(hair_region, axis=(0, 1))
-        
-        # Body region for build estimation (middle section)
-        body_region = person_crop[int(h*0.3):int(h*0.7), :]
-        
-        features = {}
-        
-        # Detect skin tone
-        b_face, g_face, r_face = face_avg
-        brightness = (r_face + g_face + b_face) / 3
-        if brightness > 180:
-            features["skin_tone"] = "light"
-        elif brightness > 120:
-            features["skin_tone"] = "medium"
-        else:
-            features["skin_tone"] = "dark"
-        
-        # Detect hair color
-        b_hair, g_hair, r_hair = hair_avg
-        if r_hair < 60 and g_hair < 60 and b_hair < 60:
-            features["hair_color"] = "dark"
-        elif r_hair > 150 and g_hair > 130:
-            features["hair_color"] = "light"  # blonde/light
-        elif r_hair > 120 and g_hair < 100:
-            features["hair_color"] = "red"
-        else:
-            features["hair_color"] = "brown"
-        
-        # Estimate hair length (based on how far down hair color extends)
-        hair_extend = int(h * 0.25)
-        lower_hair = person_crop[int(h*0.15):hair_extend, :]
-        lower_hair_avg = np.mean(lower_hair, axis=(0, 1))
-        
-        # If similar color extends down, likely longer hair
-        color_diff = np.abs(hair_avg - lower_hair_avg).mean()
-        if color_diff < 30:
-            features["hair_length"] = "long"
-        elif h > 300:
-            features["hair_length"] = "medium"
-        else:
-            features["hair_length"] = "short"
-        
-        # Detect facial hair (darker region in lower face)
-        lower_face = person_crop[int(h*0.15):int(h*0.3), :]
-        lower_face_avg = np.mean(lower_face, axis=(0, 1))
-        lower_brightness = lower_face_avg.mean()
-        
-        if lower_brightness < brightness - 30:
-            features["facial_hair"] = "beard"
-        elif lower_brightness < brightness - 15:
-            features["facial_hair"] = "mustache"
-        else:
-            features["facial_hair"] = "none"
-        
-        # Estimate build based on width-to-height ratio
-        aspect_ratio = w / h
-        if aspect_ratio > 0.55:
-            features["build"] = "heavy"
-        elif aspect_ratio > 0.4:
-            features["build"] = "average"
-        else:
-            features["build"] = "slim"
-        
-        # Glasses detection (simplified - look for bright reflections in face region)
-        # This is a basic heuristic
-        features["glasses"] = False  # Default, would need better detection
-        
-        return features
+    def analyze_features(self, person_crop):
+        """Analyze person's features using DeepFace"""
+        try:
+            # Resize image for better detection
+            h, w = person_crop.shape[:2]
+            if h < 100 or w < 100:
+                return None
+            
+            # First, try to detect face to get better analysis
+            try:
+                face_objs = DeepFace.extract_faces(person_crop, 
+                                                   detector_backend='opencv',
+                                                   enforce_detection=False,
+                                                   align=True)
+                if face_objs and len(face_objs) > 0:
+                    # Get the face with highest confidence
+                    face_obj = max(face_objs, key=lambda x: x.get('confidence', 0))
+                    facial_area = face_obj['facial_area']
+                    x, y, w_face, h_face = facial_area['x'], facial_area['y'], facial_area['w'], facial_area['h']
+                    
+                    # Extract face with some padding for context
+                    padding = 30
+                    y1 = max(0, y - padding)
+                    y2 = min(h, y + h_face + padding)
+                    x1 = max(0, x - padding)
+                    x2 = min(w, x + w_face + padding)
+                    face_crop = person_crop[y1:y2, x1:x2]
+                    
+                    # Use face crop for analysis
+                    analysis = DeepFace.analyze(face_crop, 
+                                               actions=['age', 'gender', 'race'],
+                                               enforce_detection=False,
+                                               detector_backend='skip',  # Already detected
+                                               silent=True)
+                else:
+                    # No face detected, use full crop
+                    analysis = DeepFace.analyze(person_crop, 
+                                               actions=['age', 'gender', 'race'],
+                                               enforce_detection=False,
+                                               silent=True)
+            except:
+                # Fallback to full crop analysis
+                analysis = DeepFace.analyze(person_crop, 
+                                           actions=['age', 'gender', 'race'],
+                                           enforce_detection=False,
+                                           silent=True)
+            
+            # DeepFace returns a list, get first result
+            if isinstance(analysis, list):
+                analysis = analysis[0]
+            
+            features = {}
+            
+            # Extract gender (DeepFace returns "Man" or "Woman")
+            features["gender"] = analysis.get("dominant_gender", "Unknown")
+            
+            # Extract age
+            features["age"] = int(analysis.get("age", 0))
+            
+            # Extract race (DeepFace returns: asian, indian, black, white, middle eastern, latino mediterranean)
+            race = analysis.get("dominant_race", "unknown")
+            features["race"] = race.lower()
+            
+            # Analyze hair color from top portion of person
+            hair_region = person_crop[0:int(h*0.15), :]
+            if hair_region.size > 0:
+                hair_avg = np.mean(hair_region, axis=(0, 1))
+                b_hair, g_hair, r_hair = hair_avg
+                
+                # Determine hair color
+                if r_hair < 50 and g_hair < 50 and b_hair < 50:
+                    features["hair_color"] = "black"
+                elif r_hair > 140 and g_hair > 120 and b_hair > 80:
+                    features["hair_color"] = "blonde"
+                elif r_hair > 120 and g_hair < 90 and b_hair < 70:
+                    features["hair_color"] = "red"
+                elif r_hair > 100 and g_hair > 80 and b_hair < 80:
+                    features["hair_color"] = "brown"
+                elif r_hair > 100 and g_hair > 100 and b_hair > 100:
+                    features["hair_color"] = "light_brown"
+                else:
+                    features["hair_color"] = "dark_brown"
+            else:
+                features["hair_color"] = "unknown"
+            
+            # Detect facial hair by checking if there's significant dark area in lower face
+            lower_face_region = person_crop[int(h*0.4):int(h*0.6), :]
+            if lower_face_region.size > 0:
+                gray_lower = cv2.cvtColor(lower_face_region, cv2.COLOR_BGR2GRAY)
+                dark_pixels = np.sum(gray_lower < 70)
+                total_pixels = gray_lower.size
+                features["facial_hair"] = (dark_pixels / total_pixels) > 0.25
+            else:
+                features["facial_hair"] = False
+            
+            # Better glasses detection - look for rectangular frame patterns and reflections
+            eye_region = person_crop[int(h*0.25):int(h*0.45), :]
+            if eye_region.size > 0:
+                # Convert to grayscale for edge detection
+                gray_eyes = cv2.cvtColor(eye_region, cv2.COLOR_BGR2GRAY)
+                
+                # Check for bright reflections (typical of glasses)
+                bright_pixels = np.sum(gray_eyes > 210)
+                
+                # Check for edges (frame detection)
+                edges = cv2.Canny(gray_eyes, 50, 150)
+                edge_pixels = np.sum(edges > 0)
+                
+                total_pixels = gray_eyes.size
+                
+                # Glasses likely if significant bright spots OR many edges
+                has_reflections = (bright_pixels / total_pixels) > 0.03
+                has_frames = (edge_pixels / total_pixels) > 0.15
+                
+                features["glasses"] = has_reflections or has_frames
+            else:
+                features["glasses"] = False
+            
+            return features
+            
+        except Exception as e:
+            print(f"DeepFace analysis error: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     
     def match_person(self, detected_features):
         """Match detected features against known people"""
+        if detected_features is None:
+            return None, 0
+            
         best_match = None
         best_score = 0
+        match_details = []
         
         for person in KNOWN_PEOPLE:
             score = 0
+            details = []
             person_features = person["features"]
             
-            # Score each matching feature
-            if detected_features.get("skin_tone") == person_features.get("skin_tone"):
-                score += 2  # Skin tone is important
-            if detected_features.get("hair_color") == person_features.get("hair_color"):
-                score += 2  # Hair color is important
-            if detected_features.get("hair_length") == person_features.get("hair_length"):
+            # Gender match (CRITICAL - must match!) - 3 points
+            detected_gender = detected_features.get("gender", "").lower()
+            expected_gender = person_features.get("gender", "").lower()
+            if detected_gender == expected_gender:
+                score += 3
+                details.append(f"✓ gender ({detected_gender})")
+            else:
+                # Gender mismatch is a deal-breaker - skip this person
+                details.append(f"✗ gender ({detected_gender} ≠ {expected_gender})")
+                match_details.append((person["name"], 0, details))
+                continue
+            
+            # Race match (very important) - 2 points
+            detected_race = detected_features.get("race", "").lower()
+            expected_race = person_features.get("race", "").lower()
+            if detected_race == expected_race:
+                score += 2
+                details.append(f"✓ race ({detected_race})")
+            else:
+                details.append(f"✗ race ({detected_race} ≠ {expected_race})")
+            
+            # Hair color match - 1 point
+            detected_hair = detected_features.get("hair_color", "").lower()
+            expected_hair = person_features.get("hair_color", "").lower()
+            if detected_hair == expected_hair:
                 score += 1
+                details.append(f"✓ hair_color ({detected_hair})")
+            else:
+                details.append(f"✗ hair_color ({detected_hair} ≠ {expected_hair})")
+            
+            # Age match (with tolerance) - 1 point
+            detected_age = detected_features.get("age", 0)
+            age_min, age_max = person_features.get("age_range", (0, 100))
+            if age_min - AGE_TOLERANCE <= detected_age <= age_max + AGE_TOLERANCE:
+                score += 1
+                details.append(f"✓ age ({detected_age} in {age_min}-{age_max})")
+            else:
+                details.append(f"✗ age ({detected_age} not in {age_min}-{age_max})")
+            
+            # Facial hair match - 0.5 points
             if detected_features.get("facial_hair") == person_features.get("facial_hair"):
-                score += 2  # Facial hair is distinctive
-            if detected_features.get("build") == person_features.get("build"):
-                score += 1
+                score += 0.5
+                details.append(f"✓ facial_hair")
+            else:
+                details.append(f"✗ facial_hair")
+            
+            # Glasses match - 0.5 points
             if detected_features.get("glasses") == person_features.get("glasses"):
-                score += 1
+                score += 0.5
+                details.append(f"✓ glasses")
+            else:
+                details.append(f"✗ glasses")
+            
+            match_details.append((person["name"], score, details))
             
             if score > best_score:
                 best_score = score
                 best_match = person
+        
+        # Print detailed matching info
+        print("\nMatching results:")
+        for name, score, details in sorted(match_details, key=lambda x: x[1], reverse=True):
+            print(f"  {name}: {score:.1f}/8.0 - {', '.join(details)}")
         
         # Return match only if score is above threshold
         if best_score >= MATCH_THRESHOLD:
@@ -142,8 +248,22 @@ class PersonDetector:
         # Extract person crop for analysis
         person_crop = frame[y1:y2, x1:x2]
         
-        # Analyze features
-        detected_features = self.analyze_features(person_crop, None)
+        # Analyze features using DeepFace
+        print("\n" + "="*60)
+        print("🔍 Analyzing person with DeepFace...")
+        detected_features = self.analyze_features(person_crop)
+        
+        if detected_features is None:
+            print("❌ Could not analyze person features")
+            return
+        
+        print(f"\n📊 Detected Features:")
+        print(f"  Gender: {detected_features['gender']}")
+        print(f"  Age: {detected_features['age']} years")
+        print(f"  Race: {detected_features['race']}")
+        print(f"  Hair color: {detected_features['hair_color']}")
+        print(f"  Facial hair: {'Yes' if detected_features['facial_hair'] else 'No'}")
+        print(f"  Glasses: {'Yes' if detected_features['glasses'] else 'No'}")
         
         # Match against known people
         matched_person, score = self.match_person(detected_features)
@@ -151,15 +271,13 @@ class PersonDetector:
         if matched_person:
             greeting = matched_person["greeting"]
             person_name = matched_person["name"]
-            print(f"Recognized: {person_name} (confidence: {score})")
-            print(f"Detected features: {detected_features}")
+            print(f"\n✅ MATCHED: {person_name} (score: {score:.1f}/8.0)")
         else:
             greeting = UNKNOWN_GREETING
             person_name = "Unknown"
-            print(f"Unknown person detected (score: {score})")
-            print(f"Detected features: {detected_features}")
+            print(f"\n⚠️  UNKNOWN PERSON (best score: {score:.1f}/8.0 - below threshold {MATCH_THRESHOLD})")
         
-        print(f"Speaking: {greeting}")
+        print(f"🗣️  Speaking: {greeting}\n")
         
         # Speak the greeting
         with self.lock:
@@ -233,8 +351,12 @@ class PersonDetector:
         print("Starting person detection and greeting system.")
         print(f"Known people: {len(KNOWN_PEOPLE)}")
         for person in KNOWN_PEOPLE:
-            print(f"  - {person['name']}")
+            features = person['features']
+            print(f"  - {person['name']}: {features['gender']}, age {features['age_range'][0]}-{features['age_range'][1]}, "
+                  f"{features['race']}, {'beard' if features['facial_hair'] else 'no beard'}, "
+                  f"{'glasses' if features['glasses'] else 'no glasses'}")
         print(f"\nGreetings will be given every {self.description_cooldown} seconds.")
+        print("Using DeepFace for accurate facial analysis (gender, age, race)")
         print("Press 'q' to quit.\n")
         
         while True:
