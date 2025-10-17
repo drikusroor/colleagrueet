@@ -8,7 +8,91 @@ import numpy as np
 import threading
 import os
 import tempfile
-from people_config import KNOWN_PEOPLE, MATCH_THRESHOLD, UNKNOWN_GREETING, AGE_TOLERANCE
+import pickle
+from pathlib import Path
+import json
+from config import (
+    DEFAULT_SIMILARITY_THRESHOLD,
+    UNKNOWN_GREETING,
+    FACE_MODEL,
+    PERSON_DETECTION_CONFIDENCE,
+    GREETING_COOLDOWN_SECONDS,
+    MOVEMENT_THRESHOLD_PIXELS
+)
+
+
+def load_person_config(person_folder):
+    """Load configuration for a person from their config file"""
+    config_file = Path(person_folder) / "config.txt"
+    
+    config = {
+        "name": Path(person_folder).name.title(),  # Default to folder name
+        "greeting": f"Hello {Path(person_folder).name.title()}!",  # Default greeting
+        "threshold": None  # Use default threshold
+    }
+    
+    if config_file.exists():
+        try:
+            with open(config_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    
+                    if ':' in line:
+                        key, value = line.split(':', 1)
+                        key = key.strip().lower()
+                        value = value.strip()
+                        
+                        if key == 'name':
+                            config['name'] = value
+                        elif key == 'greeting':
+                            config['greeting'] = value
+                        elif key == 'threshold':
+                            try:
+                                config['threshold'] = float(value)
+                            except ValueError:
+                                pass
+        except Exception as e:
+            print(f"⚠️  Error reading config for {person_folder}: {e}")
+    
+    return config
+
+
+def discover_people():
+    """Discover all people by scanning the faces/ directory"""
+    faces_dir = Path("faces")
+    if not faces_dir.exists():
+        return []
+    
+    people = []
+    for person_folder in sorted(faces_dir.iterdir()):
+        if not person_folder.is_dir():
+            continue
+        
+        # Skip hidden folders and examples
+        if person_folder.name.startswith('.') or person_folder.name == 'examples':
+            continue
+        
+        # Check if folder has any image files
+        image_files = []
+        for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']:
+            image_files.extend(person_folder.glob(ext))
+        
+        if not image_files:
+            continue
+        
+        # Load config for this person
+        config = load_person_config(person_folder)
+        
+        people.append({
+            "name": config["name"],
+            "greeting": config["greeting"],
+            "face_folder": str(person_folder),
+            "threshold": config["threshold"]
+        })
+    
+    return people
 
 
 class PersonDetector:
@@ -17,274 +101,243 @@ class PersonDetector:
         pygame.mixer.init()
         self.last_person_detected = None
         self.last_description_time = 0
-        self.description_cooldown = 15  # seconds between greetings
+        self.description_cooldown = GREETING_COOLDOWN_SECONDS
         self.is_speaking = False
         self.lock = threading.Lock()
-        self.greeted_people = set()  # Track who we've greeted recently
-        print("Warming up DeepFace models...")
-        # Warm up DeepFace to download models on first run
-        try:
-            dummy = np.zeros((224, 224, 3), dtype=np.uint8)
-            DeepFace.analyze(dummy, actions=['age', 'gender', 'race', 'emotion'], 
-                           enforce_detection=False, silent=True)
-        except:
-            pass
-        print("DeepFace ready!")
+        self.embeddings_db = {}  # Store face embeddings for each person
+        self.known_people = []  # List of known people
         
-    def analyze_features(self, person_crop):
-        """Analyze person's features using DeepFace"""
-        try:
-            # Resize image for better detection
-            h, w = person_crop.shape[:2]
-            if h < 100 or w < 100:
-                return None
-            
-            # First, try to detect face to get better analysis
-            try:
-                face_objs = DeepFace.extract_faces(person_crop, 
-                                                   detector_backend='opencv',
-                                                   enforce_detection=False,
-                                                   align=True)
-                if face_objs and len(face_objs) > 0:
-                    # Get the face with highest confidence
-                    face_obj = max(face_objs, key=lambda x: x.get('confidence', 0))
-                    facial_area = face_obj['facial_area']
-                    x, y, w_face, h_face = facial_area['x'], facial_area['y'], facial_area['w'], facial_area['h']
-                    
-                    # Extract face with some padding for context
-                    padding = 30
-                    y1 = max(0, y - padding)
-                    y2 = min(h, y + h_face + padding)
-                    x1 = max(0, x - padding)
-                    x2 = min(w, x + w_face + padding)
-                    face_crop = person_crop[y1:y2, x1:x2]
-                    
-                    # Use face crop for analysis
-                    analysis = DeepFace.analyze(face_crop, 
-                                               actions=['age', 'gender', 'race'],
-                                               enforce_detection=False,
-                                               detector_backend='skip',  # Already detected
-                                               silent=True)
-                else:
-                    # No face detected, use full crop
-                    analysis = DeepFace.analyze(person_crop, 
-                                               actions=['age', 'gender', 'race'],
-                                               enforce_detection=False,
-                                               silent=True)
-            except:
-                # Fallback to full crop analysis
-                analysis = DeepFace.analyze(person_crop, 
-                                           actions=['age', 'gender', 'race'],
-                                           enforce_detection=False,
-                                           silent=True)
-            
-            # DeepFace returns a list, get first result
-            if isinstance(analysis, list):
-                analysis = analysis[0]
-            
-            features = {}
-            
-            # Extract gender (DeepFace returns "Man" or "Woman")
-            features["gender"] = analysis.get("dominant_gender", "Unknown")
-            
-            # Extract age
-            features["age"] = int(analysis.get("age", 0))
-            
-            # Extract race (DeepFace returns: asian, indian, black, white, middle eastern, latino mediterranean)
-            race = analysis.get("dominant_race", "unknown")
-            features["race"] = race.lower()
-            
-            # Analyze hair color from top portion of person
-            hair_region = person_crop[0:int(h*0.15), :]
-            if hair_region.size > 0:
-                hair_avg = np.mean(hair_region, axis=(0, 1))
-                b_hair, g_hair, r_hair = hair_avg
-                
-                # Determine hair color
-                if r_hair < 50 and g_hair < 50 and b_hair < 50:
-                    features["hair_color"] = "black"
-                elif r_hair > 140 and g_hair > 120 and b_hair > 80:
-                    features["hair_color"] = "blonde"
-                elif r_hair > 120 and g_hair < 90 and b_hair < 70:
-                    features["hair_color"] = "red"
-                elif r_hair > 100 and g_hair > 80 and b_hair < 80:
-                    features["hair_color"] = "brown"
-                elif r_hair > 100 and g_hair > 100 and b_hair > 100:
-                    features["hair_color"] = "light_brown"
-                else:
-                    features["hair_color"] = "dark_brown"
-            else:
-                features["hair_color"] = "unknown"
-            
-            # Detect facial hair by checking if there's significant dark area in lower face
-            lower_face_region = person_crop[int(h*0.4):int(h*0.6), :]
-            if lower_face_region.size > 0:
-                gray_lower = cv2.cvtColor(lower_face_region, cv2.COLOR_BGR2GRAY)
-                dark_pixels = np.sum(gray_lower < 70)
-                total_pixels = gray_lower.size
-                features["facial_hair"] = (dark_pixels / total_pixels) > 0.25
-            else:
-                features["facial_hair"] = False
-            
-            # Better glasses detection - look for rectangular frame patterns and reflections
-            eye_region = person_crop[int(h*0.25):int(h*0.45), :]
-            if eye_region.size > 0:
-                # Convert to grayscale for edge detection
-                gray_eyes = cv2.cvtColor(eye_region, cv2.COLOR_BGR2GRAY)
-                
-                # Check for bright reflections (typical of glasses)
-                bright_pixels = np.sum(gray_eyes > 210)
-                
-                # Check for edges (frame detection)
-                edges = cv2.Canny(gray_eyes, 50, 150)
-                edge_pixels = np.sum(edges > 0)
-                
-                total_pixels = gray_eyes.size
-                
-                # Glasses likely if significant bright spots OR many edges
-                has_reflections = (bright_pixels / total_pixels) > 0.03
-                has_frames = (edge_pixels / total_pixels) > 0.15
-                
-                features["glasses"] = has_reflections or has_frames
-            else:
-                features["glasses"] = False
-            
-            return features
-            
-        except Exception as e:
-            print(f"DeepFace analysis error: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-    
-    def match_person(self, detected_features):
-        """Match detected features against known people"""
-        if detected_features is None:
-            return None, 0
-            
-        best_match = None
-        best_score = 0
-        match_details = []
+        print("🚀 Initializing Office Greeter with Face Recognition...")
+        print("="*60)
         
-        for person in KNOWN_PEOPLE:
-            score = 0
-            details = []
-            person_features = person["features"]
-            
-            # Gender match (CRITICAL - must match!) - 3 points
-            detected_gender = detected_features.get("gender", "").lower()
-            expected_gender = person_features.get("gender", "").lower()
-            if detected_gender == expected_gender:
-                score += 3
-                details.append(f"✓ gender ({detected_gender})")
-            else:
-                # Gender mismatch is a deal-breaker - skip this person
-                details.append(f"✗ gender ({detected_gender} ≠ {expected_gender})")
-                match_details.append((person["name"], 0, details))
-                continue
-            
-            # Race match (very important) - 2 points
-            detected_race = detected_features.get("race", "").lower()
-            expected_race = person_features.get("race", "").lower()
-            if detected_race == expected_race:
-                score += 2
-                details.append(f"✓ race ({detected_race})")
-            else:
-                details.append(f"✗ race ({detected_race} ≠ {expected_race})")
-            
-            # Hair color match - 1 point
-            detected_hair = detected_features.get("hair_color", "").lower()
-            expected_hair = person_features.get("hair_color", "").lower()
-            if detected_hair == expected_hair:
-                score += 1
-                details.append(f"✓ hair_color ({detected_hair})")
-            else:
-                details.append(f"✗ hair_color ({detected_hair} ≠ {expected_hair})")
-            
-            # Age match (with tolerance) - 1 point
-            detected_age = detected_features.get("age", 0)
-            age_min, age_max = person_features.get("age_range", (0, 100))
-            if age_min - AGE_TOLERANCE <= detected_age <= age_max + AGE_TOLERANCE:
-                score += 1
-                details.append(f"✓ age ({detected_age} in {age_min}-{age_max})")
-            else:
-                details.append(f"✗ age ({detected_age} not in {age_min}-{age_max})")
-            
-            # Facial hair match - 0.5 points
-            if detected_features.get("facial_hair") == person_features.get("facial_hair"):
-                score += 0.5
-                details.append(f"✓ facial_hair")
-            else:
-                details.append(f"✗ facial_hair")
-            
-            # Glasses match - 0.5 points
-            if detected_features.get("glasses") == person_features.get("glasses"):
-                score += 0.5
-                details.append(f"✓ glasses")
-            else:
-                details.append(f"✗ glasses")
-            
-            match_details.append((person["name"], score, details))
-            
-            if score > best_score:
-                best_score = score
-                best_match = person
+        # Discover people from faces/ directory
+        self.known_people = discover_people()
         
-        # Print detailed matching info
-        print("\nMatching results:")
-        for name, score, details in sorted(match_details, key=lambda x: x[1], reverse=True):
-            print(f"  {name}: {score:.1f}/8.0 - {', '.join(details)}")
-        
-        # Return match only if score is above threshold
-        if best_score >= MATCH_THRESHOLD:
-            return best_match, best_score
-        else:
-            return None, best_score
-        
-    def greet_person(self, bbox, frame):
-        """Identify and greet the person"""
-        x1, y1, x2, y2 = bbox
-        
-        # Extract person crop for analysis
-        person_crop = frame[y1:y2, x1:x2]
-        
-        # Analyze features using DeepFace
-        print("\n" + "="*60)
-        print("🔍 Analyzing person with DeepFace...")
-        detected_features = self.analyze_features(person_crop)
-        
-        if detected_features is None:
-            print("❌ Could not analyze person features")
+        if not self.known_people:
+            print("❌ No people found in faces/ directory!")
+            print("\n   To add people:")
+            print("   1. Create a folder: faces/yourname/")
+            print("   2. Add photos: faces/yourname/photo1.jpg")
+            print("   3. Create config: faces/yourname/config.txt")
+            print("   4. See faces/person.config.example for format")
             return
         
-        print(f"\n📊 Detected Features:")
-        print(f"  Gender: {detected_features['gender']}")
-        print(f"  Age: {detected_features['age']} years")
-        print(f"  Race: {detected_features['race']}")
-        print(f"  Hair color: {detected_features['hair_color']}")
-        print(f"  Facial hair: {'Yes' if detected_features['facial_hair'] else 'No'}")
-        print(f"  Glasses: {'Yes' if detected_features['glasses'] else 'No'}")
+        print(f"📋 Discovered {len(self.known_people)} people:")
+        for person in self.known_people:
+            threshold_info = f" (custom threshold: {person['threshold']})" if person['threshold'] else ""
+            print(f"   - {person['name']}{threshold_info}")
         
-        # Match against known people
-        matched_person, score = self.match_person(detected_features)
+        # Load or generate embeddings
+        self.load_face_embeddings()
         
-        if matched_person:
-            greeting = matched_person["greeting"]
-            person_name = matched_person["name"]
-            print(f"\n✅ MATCHED: {person_name} (score: {score:.1f}/8.0)")
+    def load_face_embeddings(self):
+        """Load or generate face embeddings for all known people"""
+        embeddings_file = "face_embeddings.pkl"
+        
+        # Try to load cached embeddings
+        if os.path.exists(embeddings_file):
+            print("📂 Loading cached face embeddings...")
+            try:
+                with open(embeddings_file, 'rb') as f:
+                    self.embeddings_db = pickle.load(f)
+                print(f"✅ Loaded embeddings for {len(self.embeddings_db)} people")
+                for name in self.embeddings_db.keys():
+                    print(f"   - {name}: {len(self.embeddings_db[name])} face(s)")
+                return
+            except Exception as e:
+                print(f"⚠️  Error loading cached embeddings: {e}")
+                print("   Regenerating embeddings...")
+        
+        # Generate new embeddings
+        print("\n🔍 Generating face embeddings from reference photos...")
+        print("   (This may take a minute on first run...)")
+        
+        for person in self.known_people:
+            name = person["name"]
+            face_folder = person["face_folder"]
+            
+            # Find all image files in the folder
+            image_files = []
+            for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']:
+                image_files.extend(Path(face_folder).glob(ext))
+            
+            # Generate embeddings for each photo
+            person_embeddings = []
+            print(f"\n   Processing {name}...")
+            
+            for img_path in image_files:
+                try:
+                    print(f"      - {img_path.name}...", end=" ")
+                    
+                    # Generate embedding using DeepFace
+                    embedding_objs = DeepFace.represent(
+                        img_path=str(img_path),
+                        model_name=FACE_MODEL,
+                        enforce_detection=False,
+                        detector_backend='opencv'
+                    )
+                    
+                    # DeepFace.represent returns a list of embeddings (one per face)
+                    if embedding_objs and len(embedding_objs) > 0:
+                        embedding = embedding_objs[0]["embedding"]
+                        person_embeddings.append(embedding)
+                        print("✓")
+                    else:
+                        print("✗ (no face detected)")
+                        
+                except Exception as e:
+                    print(f"✗ (error: {e})")
+            
+            if person_embeddings:
+                self.embeddings_db[name] = person_embeddings
+                print(f"   ✅ Loaded {len(person_embeddings)} face(s) for {name}")
+            else:
+                print(f"   ❌ No valid faces found for {name}")
+        
+        # Save embeddings to cache
+        if self.embeddings_db:
+            try:
+                with open(embeddings_file, 'wb') as f:
+                    pickle.dump(self.embeddings_db, f)
+                print(f"\n💾 Saved embeddings to {embeddings_file}")
+            except Exception as e:
+                print(f"⚠️  Could not save embeddings cache: {e}")
+        
+        print("\n" + "="*60)
+        if not self.embeddings_db:
+            print("❌ ERROR: No face embeddings loaded!")
+            print("   Please add photos to the faces/ folders and restart.")
+            print("\n   Expected structure:")
+            print("   faces/")
+            print("   ├── drikus/photo1.jpg")
+            print("   ├── robert/photo1.jpg")
+            print("   ├── mohamed/photo1.jpg")
+            print("   └── adriana/photo1.jpg")
+            return
+        
+        print(f"✅ Ready to recognize {len(self.embeddings_db)} people!")
+        print("="*60 + "\n")
+    
+    def find_matching_person(self, face_embedding):
+        """Find the best matching person based on face embedding"""
+        if not face_embedding or not self.embeddings_db:
+            return None, 0.0
+        
+        best_match = None
+        best_distance = float('inf')
+        
+        # Compare against all known people
+        for person in self.known_people:
+            name = person["name"]
+            
+            if name not in self.embeddings_db:
+                continue
+            
+            # Compare against all stored embeddings for this person
+            for stored_embedding in self.embeddings_db[name]:
+                # Calculate cosine distance
+                distance = self.cosine_distance(face_embedding, stored_embedding)
+                
+                if distance < best_distance:
+                    best_distance = distance
+                    best_match = person
+        
+        # Use person-specific threshold or default
+        threshold = best_match["threshold"] if best_match and best_match["threshold"] else DEFAULT_SIMILARITY_THRESHOLD
+        
+        # Return match only if distance is below threshold
+        if best_distance < threshold:
+            return best_match, best_distance
         else:
-            greeting = UNKNOWN_GREETING
-            person_name = "Unknown"
-            print(f"\n⚠️  UNKNOWN PERSON (best score: {score:.1f}/8.0 - below threshold {MATCH_THRESHOLD})")
+            return None, best_distance
+    
+    def cosine_distance(self, embedding1, embedding2):
+        """Calculate cosine distance between two embeddings"""
+        embedding1 = np.array(embedding1)
+        embedding2 = np.array(embedding2)
         
-        print(f"🗣️  Speaking: {greeting}\n")
+        # Cosine similarity
+        similarity = np.dot(embedding1, embedding2) / (
+            np.linalg.norm(embedding1) * np.linalg.norm(embedding2)
+        )
         
-        # Speak the greeting
-        with self.lock:
-            if not self.is_speaking:
-                self.is_speaking = True
-                threading.Thread(target=self._speak, args=(greeting,), daemon=True).start()
-                self.greeted_people.add(person_name)
+        # Convert to distance (0 = identical, 1 = completely different)
+        distance = 1 - similarity
+        return distance
+    
+    def greet_person(self, bbox, frame):
+        """Identify and greet the person using face embeddings"""
+        x1, y1, x2, y2 = bbox
+        
+        # Extract person crop
+        person_crop = frame[y1:y2, x1:x2]
+        
+        print("\n" + "="*60)
+        print("🔍 Analyzing face...")
+        
+        try:
+            # Generate embedding for detected face
+            embedding_objs = DeepFace.represent(
+                img_path=person_crop,
+                model_name=FACE_MODEL,
+                enforce_detection=False,
+                detector_backend='opencv'
+            )
+            
+            if not embedding_objs or len(embedding_objs) == 0:
+                print("❌ No face detected in frame")
+                return
+            
+            face_embedding = embedding_objs[0]["embedding"]
+            
+            # Find matching person
+            matched_person, distance = self.find_matching_person(face_embedding)
+            
+            # Display results
+            print("\n📊 Recognition Results:")
+            for person in self.known_people:
+                name = person["name"]
+                if name not in self.embeddings_db:
+                    continue
+                
+                # Calculate distance to this person
+                min_dist = float('inf')
+                for stored_emb in self.embeddings_db[name]:
+                    dist = self.cosine_distance(face_embedding, stored_emb)
+                    min_dist = min(min_dist, dist)
+                
+                match_pct = max(0, (1 - min_dist) * 100)
+                status = "✓" if matched_person and matched_person["name"] == name else " "
+                threshold = person["threshold"] if person["threshold"] else DEFAULT_SIMILARITY_THRESHOLD
+                threshold_marker = f" (threshold: {threshold})" if name == (matched_person["name"] if matched_person else None) else ""
+                print(f"   {status} {name}: {match_pct:.1f}% match (distance: {min_dist:.3f}){threshold_marker}")
+            
+            if matched_person:
+                greeting = matched_person["greeting"]
+                person_name = matched_person["name"]
+                confidence = max(0, (1 - distance) * 100)
+                print(f"\n✅ RECOGNIZED: {person_name} ({confidence:.1f}% confidence)")
+            else:
+                greeting = UNKNOWN_GREETING
+                person_name = "Unknown"
+                best_threshold = DEFAULT_SIMILARITY_THRESHOLD
+                print(f"\n⚠️  UNKNOWN PERSON (best match: {(1-distance)*100:.1f}%, threshold: {(1-best_threshold)*100:.1f}%)")
+                person_name = "Unknown"
+                print(f"\n⚠️  UNKNOWN PERSON (best match: {(1-distance)*100:.1f}%, threshold: {(1-SIMILARITY_THRESHOLD)*100:.1f}%)")
+            
+            print(f"🗣️  Speaking: {greeting}")
+            print("="*60)
+            
+            # Speak the greeting
+            with self.lock:
+                if not self.is_speaking:
+                    self.is_speaking = True
+                    threading.Thread(target=self._speak, args=(greeting,), daemon=True).start()
+                    
+        except Exception as e:
+            print(f"❌ Error during recognition: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _speak(self, text):
         """Speak text using gTTS with better voice quality"""
@@ -342,22 +395,20 @@ class PersonDetector:
         
     def run(self):
         """Main loop for webcam detection"""
+        if not self.embeddings_db:
+            print("❌ Cannot start: No face embeddings loaded!")
+            print("   Add photos to faces/ folders and restart.")
+            return
+        
         cap = cv2.VideoCapture(0)
         
         if not cap.isOpened():
             print("Error: Could not open webcam")
             return
         
-        print("Starting person detection and greeting system.")
-        print(f"Known people: {len(KNOWN_PEOPLE)}")
-        for person in KNOWN_PEOPLE:
-            features = person['features']
-            print(f"  - {person['name']}: {features['gender']}, age {features['age_range'][0]}-{features['age_range'][1]}, "
-                  f"{features['race']}, {'beard' if features['facial_hair'] else 'no beard'}, "
-                  f"{'glasses' if features['glasses'] else 'no glasses'}")
-        print(f"\nGreetings will be given every {self.description_cooldown} seconds.")
-        print("Using DeepFace for accurate facial analysis (gender, age, race)")
-        print("Press 'q' to quit.\n")
+        print("🎥 Starting webcam detection...")
+        print(f"⏱️  Greetings cooldown: {self.description_cooldown} seconds")
+        print("🔑 Press 'q' to quit\n")
         
         while True:
             ret, frame = cap.read()
@@ -378,7 +429,7 @@ class PersonDetector:
                     confidence = float(box.conf[0])
                     
                     # Only process high-confidence detections
-                    if confidence > 0.6:
+                    if confidence > 0.55:
                         person_detected = True
                         bbox = (x1, y1, x2, y2)
                         
@@ -415,7 +466,6 @@ class PersonDetector:
 def main():
     detector = PersonDetector()
     detector.run()
-
 
 
 if __name__ == "__main__":

@@ -8,3 +8,34 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Face embeddings cache
+face_embeddings.pkl
+
+# Temporary audio files
+*.mp3
+*.tmp
+
+# YOLO models (downloaded automatically)
+*.pt
+
+# Person config files (contain private information)
+faces/*/config.txt
+
+# Face photos (for privacy - remove if you want to commit them)
+faces/*/*.jpg
+faces/*/*.jpeg
+faces/*/*.png
+faces/*/*.JPG
+faces/*/*.JPEG
+faces/*/*.PNG
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo

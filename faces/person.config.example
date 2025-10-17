@@ -1,0 +1,8 @@
+# Example Person Configuration
+
+name: Example Person
+greeting: Welcome back!
+
+# Optional: Customize recognition threshold for this person (0.3-0.5)
+# Lower = more strict matching
+# threshold: 0.35
