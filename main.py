@@ -347,8 +347,6 @@ class PersonDetector:
                 person_name = "Unknown"
                 best_threshold = DEFAULT_SIMILARITY_THRESHOLD
                 print(f"\n⚠️  UNKNOWN PERSON (best match: {(1-distance)*100:.1f}%, threshold: {(1-best_threshold)*100:.1f}%)")
-                person_name = "Unknown"
-                print(f"\n⚠️  UNKNOWN PERSON (best match: {(1-distance)*100:.1f}%, threshold: {(1-SIMILARITY_THRESHOLD)*100:.1f}%)")
             
             print(f"🗣️  Speaking: {greeting}")
             print("="*60)
