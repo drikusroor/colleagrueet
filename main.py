@@ -209,10 +209,10 @@ class PersonDetector:
             print("   Please add photos to the faces/ folders and restart.")
             print("\n   Expected structure:")
             print("   faces/")
-            print("   ├── drikus/photo1.jpg")
-            print("   ├── robert/photo1.jpg")
-            print("   ├── mohamed/photo1.jpg")
-            print("   └── adriana/photo1.jpg")
+            print("   ├── alexander/photo1.jpg")
+            print("   ├── beatrix/photo1.jpg")
+            print("   ├── claus/photo1.jpg")
+            print("   └── benno/photo1.jpg")
             return
         
         print(f"✅ Ready to recognize {len(self.embeddings_db)} people!")

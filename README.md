@@ -120,13 +120,13 @@ uv run main.py
 🔍 Analyzing face...
 
 📊 Recognition Results:
-   ✓ Drikus: 87.3% match (distance: 0.127)
-     Robert: 45.2% match (distance: 0.548)
-     Adriana: 23.1% match (distance: 0.769)
-     Mohamed: 31.4% match (distance: 0.686)
+   ✓ Alexander: 87.3% match (distance: 0.127)
+     Beatrix: 45.2% match (distance: 0.548)
+     Claus: 23.1% match (distance: 0.769)
+     Benno: 31.4% match (distance: 0.686)
 
-✅ RECOGNIZED: Drikus (87.3% confidence)
-🗣️  Speaking: Hello Drikus! Welcome back!
+✅ RECOGNIZED: Alexander (87.3% confidence)
+🗣️  Speaking: Hello Alexander! Welcome back!
 ```
 
 ## ⚙️ Configuration

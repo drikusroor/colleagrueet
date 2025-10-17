@@ -1,5 +1,5 @@
 [project]
-name = "person-detector"
+name = "colleagrueet"
 version = "0.2.0"
 description = "Add your description here"
 requires-python = ">=3.9"
