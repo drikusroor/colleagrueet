@@ -15,3 +15,12 @@ dependencies = [
     "tf-keras>=2.20.1",
     "ultralytics>=8.3.214",
 ]
+
+# Note: picamera2 is NOT included as a dependency because it's Linux-only
+# On Raspberry Pi, install it separately via system packages:
+# sudo apt install -y python3-picamera2
+
+[project.optional-dependencies]
+# Raspberry Pi specific dependencies
+raspberry-pi = [
+]

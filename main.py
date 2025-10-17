@@ -11,14 +11,39 @@ import tempfile
 import pickle
 from pathlib import Path
 import json
+import platform
 from config import (
     DEFAULT_SIMILARITY_THRESHOLD,
     UNKNOWN_GREETING,
     FACE_MODEL,
     PERSON_DETECTION_CONFIDENCE,
     GREETING_COOLDOWN_SECONDS,
-    MOVEMENT_THRESHOLD_PIXELS
+    MOVEMENT_THRESHOLD_PIXELS,
+    CAMERA_TYPE,
+    PICAMERA_RESOLUTION,
+    PICAMERA_FRAMERATE,
+    ENABLE_PI_OPTIMIZATIONS,
+    PI_FRAME_SKIP
 )
+
+# Try to import picamera2 for Raspberry Pi support
+try:
+    from picamera2 import Picamera2
+    PICAMERA_AVAILABLE = True
+except ImportError:
+    PICAMERA_AVAILABLE = False
+
+
+def is_raspberry_pi():
+    """Check if running on Raspberry Pi"""
+    try:
+        with open('/proc/cpuinfo', 'r') as f:
+            for line in f:
+                if 'Raspberry Pi' in line:
+                    return True
+    except:
+        pass
+    return False
 
 
 def load_person_config(person_folder):
@@ -400,21 +425,38 @@ class PersonDetector:
             print("   Add photos to faces/ folders and restart.")
             return
         
-        cap = cv2.VideoCapture(0)
+        if CAMERA_TYPE == "picamera" and PICAMERA_AVAILABLE and is_raspberry_pi():
+            print("🎥 Using Raspberry Pi Camera with picamera2...")
+            picam2 = Picamera2()
+            picam2.configure(picam2.create_preview_configuration(
+                main={"size": PICAMERA_RESOLUTION, "format": "RGB888"}))
+            picam2.start()
+        else:
+            print("🎥 Using default webcam...")
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                print("Error: Could not open webcam")
+                return
         
-        if not cap.isOpened():
-            print("Error: Could not open webcam")
-            return
-        
-        print("🎥 Starting webcam detection...")
+        print("🎥 Starting detection...")
         print(f"⏱️  Greetings cooldown: {self.description_cooldown} seconds")
         print("🔑 Press 'q' to quit\n")
         
+        frame_skip = PI_FRAME_SKIP if ENABLE_PI_OPTIMIZATIONS and is_raspberry_pi() else 1
+        frame_count = 0
+        
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("Error: Failed to capture frame")
-                break
+            if CAMERA_TYPE == "picamera" and PICAMERA_AVAILABLE and is_raspberry_pi():
+                frame = picam2.capture_array()
+            else:
+                ret, frame = cap.read()
+                if not ret:
+                    print("Error: Failed to capture frame")
+                    break
+            
+            frame_count += 1
+            if frame_count % frame_skip != 0:
+                continue
             
             # Run YOLO detection
             results = self.model(frame, classes=[0], verbose=False)  # class 0 is 'person'
@@ -458,7 +500,10 @@ class PersonDetector:
                 break
         
         # Cleanup
-        cap.release()
+        if CAMERA_TYPE == "picamera" and PICAMERA_AVAILABLE and is_raspberry_pi():
+            picam2.stop()
+        else:
+            cap.release()
         cv2.destroyAllWindows()
         pygame.mixer.quit()
 
